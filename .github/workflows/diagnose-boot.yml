@@ -1,0 +1,135 @@
+# 诊断：对比原版 OES 镜像与 rebuild 产物的引导结构差异
+name: Diagnose boot structure
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref_url:
+        description: "参考镜像（原版 OES，能引导）"
+        required: true
+        default: "https://github.com/ophub/amlogic-s9xxx-armbian/releases/download/Armbian_noble_arm64_server_2026.11/Armbian_26.11.0_amlogic_a311d-oes_noble_6.18.60_server_2026.11.08.img.gz"
+      mine_url:
+        description: "待查镜像（rebuild 产物）"
+        required: true
+        default: "https://github.com/zaoanshijie/amlogic-s9xxx-armbian/releases/download/oes-noble-k6.18.y-20261109-1557/Armbian_26.11.0_amlogic_a311d-oes_noble_6.18.62_server_2026.11.09.img.gz"
+      base_url:
+        description: "rebuild 的输入基础镜像（trunk）"
+        required: false
+        default: "https://github.com/ophub/amlogic-s9xxx-armbian/releases/download/Armbian_noble_arm64_server_2026.11/Armbian_26.11.0-trunk_noble_arm64_6.18.62.img.gz"
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-26.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq parted dosfstools xxd curl
+          df -h / | tail -1
+
+      - name: Prepare space
+        run: |
+          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+          size=$(( root_avail - 6 ))
+          [[ "$size" -gt 0 ]] || { echo "空间不足"; exit 1; }
+          sudo truncate -s "${size}G" /work.img
+          dev=$(sudo losetup --find --show /work.img)
+          sudo mkfs.ext4 -F "$dev" >/dev/null 2>&1
+          sudo mkdir -p /work && sudo mount "$dev" /work
+          sudo chown -R "$(id -u):$(id -g)" /work
+          df -h /work | tail -1
+
+      - name: Analyze images
+        env:
+          REF_URL: ${{ inputs.ref_url }}
+          MINE_URL: ${{ inputs.mine_url }}
+          BASE_URL: ${{ inputs.base_url }}
+        run: |
+          set -u
+          mkdir -p /work/imgs /work/out
+          cd /work/imgs
+
+          fetch() {
+            local name="$1" url="$2"
+            [[ -z "$url" ]] && return 0
+            echo "下载 $name ..."
+            curl -fsSL --retry 3 -o "${name}.img.gz" "$url" || { echo "下载失败 $name"; return 1; }
+            gunzip -c "${name}.img.gz" > "${name}.img" && rm -f "${name}.img.gz"
+            ls -lh "${name}.img"
+          }
+
+          fetch ref  "$REF_URL"  || true
+          fetch mine "$MINE_URL" || true
+          fetch base "$BASE_URL" || true
+
+          for n in ref mine base; do
+            f="/work/imgs/${n}.img"
+            [[ -f "$f" ]] || continue
+            echo "############ $n ############" | tee "/work/out/${n}.txt"
+            echo "== 文件大小 ==" >> "/work/out/${n}.txt"
+            stat -c '%s bytes' "$f" >> "/work/out/${n}.txt"
+
+            echo "== 分区表 ==" >> "/work/out/${n}.txt"
+            parted -s -m "$f" unit s print 2>&1 | tail -n +2 >> "/work/out/${n}.txt"
+
+            echo "== 前 512 字节（MBR，看引导代码是否非零）==" >> "/work/out/${n}.txt"
+            xxd -l 512 "$f" | head -8 >> "/work/out/${n}.txt"
+
+            echo "== 前 1MiB 非零字节统计 ==" >> "/work/out/${n}.txt"
+            dd if="$f" bs=1M count=1 2>/dev/null | tr -d '\0' | wc -c >> "/work/out/${n}.txt"
+
+            echo "== 偏移 1MiB 处 4KiB（u-boot 常见区）==" >> "/work/out/${n}.txt"
+            xxd -s 1048576 -l 4096 "$f" | head -6 >> "/work/out/${n}.txt"
+
+            # 定位 FAT 分区并挂载
+            pn=$(parted -s -m "$f" unit s print 2>/dev/null | awk -F: '/fat/{print $1; exit}')
+            if [[ -z "$pn" ]]; then
+              echo "!! 未找到 FAT 分区" >> "/work/out/${n}.txt"
+              continue
+            fi
+            loop=$(sudo losetup -fP --show "$f")
+            mnt="/work/mnt_${n}"; mkdir -p "$mnt"
+            if sudo mount "${loop}p${pn}" "$mnt" 2>/dev/null; then
+              echo "== boot 分区文件清单 ==" >> "/work/out/${n}.txt"
+              ls -la "$mnt" >> "/work/out/${n}.txt" 2>&1
+              echo "== 关键引导文件 ==" >> "/work/out/${n}.txt"
+              for k in u-boot.ext aml_autoscript s905_autoscript emmc_autoscript boot.scr boot.ini extlinux uEnv.txt; do
+                if [[ -e "$mnt/$k" ]]; then
+                  printf '%-18s 存在  %s\n' "$k" "$(stat -c '%s bytes' "$mnt/$k" 2>/dev/null)" >> "/work/out/${n}.txt"
+                else
+                  printf '%-18s 缺失\n' "$k" >> "/work/out/${n}.txt"
+                fi
+              done
+              echo "== u-boot 相关文件 ==" >> "/work/out/${n}.txt"
+              ls -la "$mnt" 2>/dev/null | grep -i "u-boot\|uboot" >> "/work/out/${n}.txt" || echo "(无)" >> "/work/out/${n}.txt"
+              echo "== uEnv.txt ==" >> "/work/out/${n}.txt"
+              cat "$mnt/uEnv.txt" 2>/dev/null >> "/work/out/${n}.txt"
+              echo "== dtb 目录中 oes 系列 ==" >> "/work/out/${n}.txt"
+              ls "$mnt/dtb/amlogic" 2>/dev/null | grep -i oes >> "/work/out/${n}.txt" || echo "(无)" >> "/work/out/${n}.txt"
+              sudo umount "$mnt"
+            else
+              echo "!! 挂载失败" >> "/work/out/${n}.txt"
+            fi
+            sudo losetup -d "$loop" 2>/dev/null || true
+            rm -rf "$mnt"
+            echo "" >> "/work/out/${n}.txt"
+          done
+
+      - name: Print report
+        run: |
+          for f in /work/out/*.txt; do
+            echo "=============================================="
+            cat "$f"
+            echo
+          done
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-diagnose-${{ github.run_number }}
+          path: /work/out/*.txt
+          retention-days: 7
+          if-no-files-found: error
