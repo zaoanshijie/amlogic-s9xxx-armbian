@@ -183,51 +183,71 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          imgs=( build/output/images/*.img.gz build/output/images/*.img )
-          [[ ${#imgs[@]} -gt 0 ]] || { echo "未找到产物镜像"; ls -lR build/output/images || true; exit 1; }
 
-          SRC="${imgs[0]}"
-          echo "校验对象: ${SRC}"
-          TMP="$(mktemp -d)"
-          if [[ "${SRC}" == *.gz ]]; then
-            echo "解压中..."
-            gunzip -c "${SRC}" > "${TMP}/check.img"
-          else
-            cp "${SRC}" "${TMP}/check.img"
-          fi
+          echo "=== build/output/images 全部内容 ==="
+          ls -lh build/output/images || true
 
-          # 定位 FAT 启动分区
-          PART_NUM=$(parted -s -m "${TMP}/check.img" unit s print | awk -F: '/fat/{print $1; exit}')
-          [[ -n "${PART_NUM}" ]] || { echo "未找到 FAT 启动分区"; exit 1; }
+          # 产物目录里同时有输入的基础镜像（trunk），必须只挑 OES 产物
+          imgs=( build/output/images/*a311d-oes*.img.gz build/output/images/*a311d-oes*.img )
+          [[ ${#imgs[@]} -gt 0 ]] || { echo "::error::未找到 a311d-oes 产物"; exit 1; }
+          echo "待校验 ${#imgs[@]} 个产物"
 
-          LOOP=$(sudo losetup -fP --show "${TMP}/check.img")
-          MNT="${TMP}/mnt"; mkdir -p "${MNT}"
-          sudo mount "${LOOP}p${PART_NUM}" "${MNT}"
-          trap 'sudo umount "${MNT}" 2>/dev/null || true; sudo losetup -d "${LOOP}" 2>/dev/null || true' EXIT
+          fail=0
+          for SRC in "${imgs[@]}"; do
+            echo "----------------------------------------"
+            echo "校验: ${SRC}"
+            TMP="$(mktemp -d)"
+            IMGF="${TMP}/check.img"
+            if [[ "${SRC}" == *.gz ]]; then
+              gunzip -c "${SRC}" > "${IMGF}"
+            else
+              cp "${SRC}" "${IMGF}"
+            fi
 
-          echo "--- uEnv.txt ---"
-          sudo cat "${MNT}/uEnv.txt"
-          GOT=$(sudo grep -E '^FDT=' "${MNT}/uEnv.txt" | tail -1 | sed 's/^FDT=//')
-          echo "实际 FDT: ${GOT}"
-          echo "期望 FDT: ${EXPECT_FDT}"
+            # 定位 FAT 启动分区（MBR 与 GPT 都兼容）
+            PART_NUM=$(parted -s -m "${IMGF}" unit s print 2>/dev/null | awk -F: '/fat/{print $1; exit}')
+            if [[ -z "${PART_NUM}" ]]; then
+              echo "::error::${SRC} 未找到 FAT 启动分区"; fail=1; rm -rf "${TMP}"; continue
+            fi
+            echo "启动分区: p${PART_NUM}"
 
-          [[ "${GOT}" == "${EXPECT_FDT}" ]] || { echo "::error::产物 FDT 不是 -b 变体，构建失败"; exit 1; }
+            LOOP=$(sudo losetup -fP --show "${IMGF}")
+            MNT="${TMP}/mnt"; mkdir -p "${MNT}"
+            sudo mount "${LOOP}p${PART_NUM}" "${MNT}"
 
-          # 确认 -b dtb 真的存在，且内容是 rxid 版本
-          DTB="${MNT}/dtb/amlogic/meson-g12b-a311d-oes-b.dtb"
-          [[ -f "${DTB}" ]] || { echo "::error::镜像内缺少 -b dtb"; exit 1; }
-          dtc -I dtb -O dts "${DTB}" 2>/dev/null | grep -q "rgmii-rxid" \
-            || { echo "::error::-b dtb 内容不是 rgmii-rxid"; exit 1; }
-          echo "✅ 校验通过：FDT 指向 -b，dtb 内容为 rgmii-rxid"
+            echo "--- uEnv.txt ---"
+            sudo cat "${MNT}/uEnv.txt" || true
+            GOT=$(sudo grep -E '^FDT=' "${MNT}/uEnv.txt" 2>/dev/null | tail -1 | sed 's/^FDT=//')
+            echo "实际 FDT: ${GOT:-<空>}"
+            echo "期望 FDT: ${EXPECT_FDT}"
 
-          echo "镜像信息: $(ls -lh "${SRC}" | awk '{print $5}')"
-          rm -f "${TMP}/check.img"
+            if [[ "${GOT}" != "${EXPECT_FDT}" ]]; then
+              echo "::error::${SRC} 的 FDT 不是 -b 变体"
+              fail=1
+            else
+              DTB="${MNT}/dtb/amlogic/meson-g12b-a311d-oes-b.dtb"
+              if [[ ! -f "${DTB}" ]]; then
+                echo "::error::${SRC} 内缺少 -b dtb"; fail=1
+              elif ! dtc -I dtb -O dts "${DTB}" 2>/dev/null | grep -q "rgmii-rxid"; then
+                echo "::error::${SRC} 的 -b dtb 内容不是 rgmii-rxid"; fail=1
+              else
+                echo "✅ 通过：FDT 指向 -b，dtb 为 rgmii-rxid，大小 $(ls -lh "${SRC}" | awk '{print $5}')"
+              fi
+            fi
+
+            sudo umount "${MNT}" 2>/dev/null || true
+            sudo losetup -d "${LOOP}" 2>/dev/null || true
+            rm -rf "${TMP}"
+          done
+
+          [[ "${fail}" -eq 0 ]] || { echo "::error::存在校验失败的产物"; exit 1; }
+          echo "全部产物校验通过"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: oes-image-${{ github.run_number }}
-          path: build/output/images/*
+          path: build/output/images/*a311d-oes*
           retention-days: 14
           if-no-files-found: error
 
@@ -248,7 +268,7 @@ jobs:
             "默认账号 \`root\` / 密码 \`1234\`。装机命令 \`armbian-install\`，升级命令 \`armbian-update\`。" \
             "" \
             "本镜像已修正上游 Model A/B 网卡差异导致的千兆丢包问题。")
-          gh release create "${TAG}" build/output/images/* \
+          gh release create "${TAG}" build/output/images/*a311d-oes* \
             --title "OES 镜像 ${TAG}（默认 -b DTB）" \
             --notes "${BODY}" \
             --repo "${GITHUB_REPOSITORY}"
