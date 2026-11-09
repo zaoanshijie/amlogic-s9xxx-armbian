@@ -1,0 +1,243 @@
+#==========================================================================
+# Build OES image only, with default dtb switched to the -b variant
+#
+# 与上游 build-armbian-using-official-image.yml 的区别：
+#   1. 板型固定为 a311d-oes（只产出 OES 镜像）
+#   2. 使用本仓库（fork）内的 action，从而应用 model_database.conf 的改动：
+#      WXY-OES 的 FDTFILE 已由 meson-g12b-a311d-oes-a.dtb 改为 -b.dtb
+#   3. 构建后强制校验产物 uEnv.txt 的 FDT 指向 -b，校验不过则失败
+#==========================================================================
+
+name: Build OES image (default dtb = -b)
+
+on:
+  workflow_dispatch:
+    inputs:
+      set_release:
+        description: "OS 版本（自动获取官方基础镜像时生效）"
+        required: true
+        default: "noble"
+        type: choice
+        options:
+          - noble
+          - bookworm
+          - trixie
+          - resolute
+      armbian_url:
+        description: "自定义基础镜像 URL（留空则按上面的 OS 版本自动取最新官方镜像）"
+        required: false
+        default: ""
+      armbian_kernel:
+        description: "内核版本：填 6.18.y 取该系列最新；填 6.18.60 锁定具体版本；多个用 _ 连接"
+        required: true
+        default: "6.18.y"
+      kernel_usage:
+        description: "内核标签"
+        required: true
+        default: "stable"
+        type: choice
+        options:
+          - stable
+          - flippy
+          - beta
+      armbian_fstype:
+        description: "rootfs 文件系统"
+        required: true
+        default: "ext4"
+        type: choice
+        options:
+          - ext4
+          - btrfs
+      make_release:
+        description: "构建成功后发布 Release（便于直接下载）"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+env:
+  TZ: Etc/UTC
+  TARGET_BOARD: a311d-oes
+  EXPECT_FDT: /dtb/amlogic/meson-g12b-a311d-oes-b.dtb
+
+jobs:
+  build:
+    # rebuild 需要在 arm64 上挂载并改写镜像；公开仓库可用 ARM runner
+    runs-on: ubuntu-26.04-arm
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize build environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null || true
+          sudo swapoff -a || true
+          sudo rm -f /swapfile 2>/dev/null || true
+          sudo apt-get -y update
+          sudo apt-get -y install device-tree-compiler parted pigz curl xz-utils dosfstools
+          sudo apt-get -y autoremove --purge || true
+          sudo apt-get clean
+          sudo timedatectl set-timezone "${TZ:-Etc/UTC}" || true
+          dtc --version
+          df -h / | tail -1
+
+      - name: Create virtual disk for extended storage
+        run: |
+          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+          root_size=$(( root_avail - 4 ))
+          [[ "${root_size}" -gt 0 ]] || { echo "空间不足: ${root_avail}G"; exit 1; }
+          sudo truncate -s "${root_size}G" /root.img
+          build_dev=$(sudo losetup --find --show /root.img)
+          echo "扩展盘: ${root_size}G -> ${build_dev}"
+          sudo mkfs.xfs -f -i sparse=0 -b size=4096 "${build_dev}" 2>/dev/null || sudo mkfs.ext4 -F "${build_dev}"
+          sudo mkdir -p /builder
+          sudo mount "${build_dev}" /builder
+          sudo chown -R "$(id -u):$(id -g)" /builder
+          df -Th | tail -2
+
+      - name: Resolve base image URL
+        id: down
+        run: |
+          url="${{ inputs.armbian_url }}"
+          if [[ -z "${url}" ]]; then
+            rel="${{ inputs.set_release }}"
+            site="https://armbian.tnahosting.net/dl/odroidn2/archive/"
+            name="Armbian_.*${rel}.*_server_.*\.img\.xz"
+            file=$(curl -s "${site}" | grep -oE "${name}" | sort -V | tail -n 1)
+            [[ -n "${file}" ]] || { echo "未找到 ${rel} 基础镜像于 ${site}"; exit 1; }
+            url="${site}${file}"
+          fi
+          echo "基础镜像: ${url}"
+          echo "ARMBIAN_URL=${url}" >> "$GITHUB_ENV"
+
+          # 从 URL 推断 OS 名，用于产物 tag
+          tag_os=""
+          for r in resolute noble trixie bookworm; do
+            [[ "$url" == *"${r}"* ]] && { tag_os="_${r}"; break; }
+          done
+          echo "BUILD_TAG=Armbian${tag_os}_${TARGET_BOARD}_$(date -u +%Y.%m.%d)" >> "$GITHUB_ENV"
+
+          mkdir -p /builder/build
+          ln -sfn /builder/build "${GITHUB_WORKSPACE}/build"
+          df -h / | tail -1
+
+      - name: Decide auto_kernel
+        id: kern
+        run: |
+          k="${{ inputs.armbian_kernel }}"
+          # 形如 6.18.60（含三段版本号）视为锁定具体版本
+          if [[ "${k}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "AUTO_KERNEL=false" >> "$GITHUB_ENV"
+            echo "内核: 锁定具体版本 ${k}"
+          else
+            echo "AUTO_KERNEL=true" >> "$GITHUB_ENV"
+            echo "内核: 分支 ${k}，自动取最新"
+          fi
+
+      - name: Show effective config
+        run: |
+          echo "板型        : ${TARGET_BOARD}"
+          echo "期望 FDT    : ${EXPECT_FDT}"
+          echo "基础镜像    : ${ARMBIAN_URL}"
+          echo "内核        : ${{ inputs.armbian_kernel }} (auto=${AUTO_KERNEL}, usage=${{ inputs.kernel_usage }})"
+          echo "rootfs      : ${{ inputs.armbian_fstype }}"
+          echo "--- 本仓库板型表的 OES 行（确认已改为 -b）---"
+          grep -n "WXY-OES " build-armbian/armbian-files/common-files/etc/model_database.conf || true
+
+      - name: Rebuild Armbian for OES
+        uses: ./
+        with:
+          build_target: armbian
+          armbian_path: ${{ env.ARMBIAN_URL }}
+          armbian_board: ${{ env.TARGET_BOARD }}
+          armbian_kernel: ${{ inputs.armbian_kernel }}
+          auto_kernel: ${{ env.AUTO_KERNEL }}
+          kernel_repo: ophub/kernel
+          kernel_usage: ${{ inputs.kernel_usage }}
+          armbian_fstype: ${{ inputs.armbian_fstype }}
+          builder_name: oes-bdtb
+
+      - name: Verify resulting image uses -b dtb
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          imgs=( build/output/images/*.img.gz build/output/images/*.img )
+          [[ ${#imgs[@]} -gt 0 ]] || { echo "未找到产物镜像"; ls -lR build/output/images || true; exit 1; }
+
+          SRC="${imgs[0]}"
+          echo "校验对象: ${SRC}"
+          TMP="$(mktemp -d)"
+          if [[ "${SRC}" == *.gz ]]; then
+            echo "解压中..."
+            gunzip -c "${SRC}" > "${TMP}/check.img"
+          else
+            cp "${SRC}" "${TMP}/check.img"
+          fi
+
+          # 定位 FAT 启动分区
+          PART_NUM=$(parted -s -m "${TMP}/check.img" unit s print | awk -F: '/fat/{print $1; exit}')
+          [[ -n "${PART_NUM}" ]] || { echo "未找到 FAT 启动分区"; exit 1; }
+
+          LOOP=$(sudo losetup -fP --show "${TMP}/check.img")
+          MNT="${TMP}/mnt"; mkdir -p "${MNT}"
+          sudo mount "${LOOP}p${PART_NUM}" "${MNT}"
+          trap 'sudo umount "${MNT}" 2>/dev/null || true; sudo losetup -d "${LOOP}" 2>/dev/null || true' EXIT
+
+          echo "--- uEnv.txt ---"
+          sudo cat "${MNT}/uEnv.txt"
+          GOT=$(sudo grep -E '^FDT=' "${MNT}/uEnv.txt" | tail -1 | sed 's/^FDT=//')
+          echo "实际 FDT: ${GOT}"
+          echo "期望 FDT: ${EXPECT_FDT}"
+
+          [[ "${GOT}" == "${EXPECT_FDT}" ]] || { echo "::error::产物 FDT 不是 -b 变体，构建失败"; exit 1; }
+
+          # 确认 -b dtb 真的存在，且内容是 rxid 版本
+          DTB="${MNT}/dtb/amlogic/meson-g12b-a311d-oes-b.dtb"
+          [[ -f "${DTB}" ]] || { echo "::error::镜像内缺少 -b dtb"; exit 1; }
+          dtc -I dtb -O dts "${DTB}" 2>/dev/null | grep -q "rgmii-rxid" \
+            || { echo "::error::-b dtb 内容不是 rgmii-rxid"; exit 1; }
+          echo "✅ 校验通过：FDT 指向 -b，dtb 内容为 rgmii-rxid"
+
+          echo "镜像信息: $(ls -lh "${SRC}" | awk '{print $5}')"
+          rm -f "${TMP}/check.img"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oes-image-${{ github.run_number }}
+          path: build/output/images/*
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish release
+        if: ${{ inputs.make_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="oes-${{ inputs.set_release }}-k${{ inputs.armbian_kernel }}-$(date -u +%Y%m%d-%H%M)"
+          BODY=$(printf '%s\n' \
+            "### OES 镜像（默认 DTB = -b）" \
+            "" \
+            "- 板型: \`a311d-oes\`（仅此一款）" \
+            "- 内核: \`${{ inputs.armbian_kernel }}\` (${{ inputs.kernel_usage }}, auto=${AUTO_KERNEL})" \
+            "- rootfs: \`${{ inputs.armbian_fstype }}\`" \
+            "- 启动 DTB: \`meson-g12b-a311d-oes-b.dtb\` (rgmii-rxid + rx-internal-delay-ps=1000 + invert-rxclk)" \
+            "" \
+            "默认账号 \`root\` / 密码 \`1234\`。装机命令 \`armbian-install\`，升级命令 \`armbian-update\`。" \
+            "" \
+            "本镜像已修正上游 Model A/B 网卡差异导致的千兆丢包问题。")
+          gh release create "${TAG}" build/output/images/* \
+            --title "OES 镜像 ${TAG}（默认 -b DTB）" \
+            --notes "${BODY}" \
+            --repo "${GITHUB_REPOSITORY}"
+          echo "Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
