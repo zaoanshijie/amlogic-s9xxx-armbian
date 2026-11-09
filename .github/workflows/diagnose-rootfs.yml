@@ -1,0 +1,126 @@
+# 诊断 2：对比 rootfs 内容差异
+name: Diagnose rootfs
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref_url:
+        description: "参考镜像（原版 OES）"
+        required: true
+        default: "https://github.com/ophub/amlogic-s9xxx-armbian/releases/download/Armbian_noble_arm64_server_2026.11/Armbian_26.11.0_amlogic_a311d-oes_noble_6.18.60_server_2026.11.08.img.gz"
+      mine_url:
+        description: "待查镜像（rebuild 产物）"
+        required: true
+        default: "https://github.com/zaoanshijie/amlogic-s9xxx-armbian/releases/download/oes-noble-k6.18.y-20261109-1557/Armbian_26.11.0_amlogic_a311d-oes_noble_6.18.62_server_2026.11.09.img.gz"
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-26.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq parted xxd curl
+          df -h / | tail -1
+
+      - name: Prepare space
+        run: |
+          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+          size=$(( root_avail - 6 ))
+          sudo truncate -s "${size}G" /work.img
+          dev=$(sudo losetup --find --show /work.img)
+          sudo mkfs.ext4 -F "$dev" >/dev/null 2>&1
+          sudo mkdir -p /work && sudo mount "$dev" /work
+          sudo chown -R "$(id -u):$(id -g)" /work
+          df -h /work | tail -1
+
+      - name: Analyze rootfs
+        env:
+          REF_URL: ${{ inputs.ref_url }}
+          MINE_URL: ${{ inputs.mine_url }}
+        run: |
+          set -u
+          mkdir -p /work/imgs /work/out
+          cd /work/imgs
+
+          fetch() {
+            local name="$1" url="$2"
+            curl -fsSL --retry 3 -o "${name}.img.gz" "$url" || return 1
+            gunzip -c "${name}.img.gz" > "${name}.img" && rm -f "${name}.img.gz"
+          }
+          fetch ref  "$REF_URL"  || true
+          fetch mine "$MINE_URL" || true
+
+          for n in ref mine; do
+            f="/work/imgs/${n}.img"
+            [[ -f "$f" ]] || continue
+            O="/work/out/${n}.txt"
+            echo "############ $n ############" > "$O"
+
+            pn=$(parted -s -m "$f" unit s print 2>/dev/null | awk -F: '/ext4/{print $1; exit}')
+            echo "rootfs 分区号: ${pn}" >> "$O"
+            [[ -n "$pn" ]] || continue
+
+            loop=$(sudo losetup -fP --show "$f")
+            mnt="/work/root_${n}"; mkdir -p "$mnt"
+            if ! sudo mount "${loop}p${pn}" "$mnt" 2>/dev/null; then
+              echo "!! rootfs 挂载失败" >> "$O"
+              sudo losetup -d "$loop" 2>/dev/null || true
+              continue
+            fi
+
+            {
+              echo "== 顶层目录 =="
+              ls "$mnt"
+              echo "== 占用 =="
+              du -sh "$mnt" 2>/dev/null | tail -1
+              echo "== 文件总数 =="
+              sudo find "$mnt" -xdev 2>/dev/null | wc -l
+              echo "== /etc/os-release =="
+              cat "$mnt/etc/os-release" 2>/dev/null | head -4
+              echo "== /etc/armbian-release =="
+              cat "$mnt/etc/armbian-release" 2>/dev/null | head -12
+              echo "== /etc/fstab =="
+              cat "$mnt/etc/fstab" 2>/dev/null
+              echo "== /sbin/init =="
+              ls -la "$mnt/sbin/init" 2>/dev/null || echo "(无 /sbin/init)"
+              echo "== systemd =="
+              ls -la "$mnt/lib/systemd/systemd" 2>/dev/null | head -2 || echo "(无 systemd)"
+              echo "== default.target =="
+              ls -la "$mnt/etc/systemd/system/default.target" 2>/dev/null || echo "(无)"
+              echo "== multi-user.target.wants 数量 =="
+              ls "$mnt/etc/systemd/system/multi-user.target.wants" 2>/dev/null | wc -l
+              echo "== /usr/lib/u-boot =="
+              ls "$mnt/usr/lib/u-boot" 2>/dev/null | head -10 || echo "(无)"
+              echo "== rootfs 内 /boot =="
+              ls "$mnt/boot" 2>/dev/null | head -20 || echo "(无)"
+              echo "== 内核 modules 目录 =="
+              ls "$mnt/lib/modules" 2>/dev/null || echo "(无)"
+              echo "== 网络固件 =="
+              ls "$mnt/lib/firmware" 2>/dev/null | wc -l
+            } >> "$O" 2>&1
+
+            sudo umount "$mnt"
+            sudo losetup -d "$loop" 2>/dev/null || true
+            rm -rf "$mnt"
+            echo "" >> "$O"
+          done
+
+      - name: Print report
+        run: |
+          for f in /work/out/*.txt; do
+            echo "=============================================="
+            cat "$f"
+            echo
+          done
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-diagnose-${{ github.run_number }}
+          path: /work/out/*.txt
+          retention-days: 7
+          if-no-files-found: error
