@@ -107,15 +107,27 @@ jobs:
 
       - name: Resolve base image URL
         id: down
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           url="${{ inputs.armbian_url }}"
           if [[ -z "${url}" ]]; then
             rel="${{ inputs.set_release }}"
-            site="https://armbian.tnahosting.net/dl/odroidn2/archive/"
-            name="Armbian_.*${rel}.*_server_.*\.img\.xz"
-            file=$(curl -s "${site}" | grep -oE "${name}" | sort -V | tail -n 1)
-            [[ -n "${file}" ]] || { echo "未找到 ${rel} 基础镜像于 ${site}"; exit 1; }
-            url="${site}${file}"
+            # 取 ophub 发布的最新通用 arm64 基础镜像（trunk，非板型专用）
+            echo "查询 ${rel} 的 ophub release..."
+            tag=$(gh api --paginate "repos/ophub/amlogic-s9xxx-armbian/releases" \
+                    --jq '.[].tag_name' 2>/dev/null \
+                  | grep -E "^Armbian_${rel}_arm64_server_" | sort -V | tail -n 1)
+            [[ -n "${tag}" ]] || { echo "::error::未找到 ${rel} 对应的 release tag"; exit 1; }
+            echo "release tag: ${tag}"
+
+            asset=$(gh api --paginate "repos/ophub/amlogic-s9xxx-armbian/releases/tags/${tag}" \
+                      --jq '.assets[].name' 2>/dev/null \
+                    | grep -E "^Armbian_.*-trunk_${rel}_arm64_.*\.img\.gz$" | sort -V | tail -n 1)
+            [[ -n "${asset}" ]] || { echo "::error::${tag} 中未找到 trunk_${rel}_arm64 基础镜像"; exit 1; }
+            echo "基础镜像文件: ${asset}"
+
+            url="https://github.com/ophub/amlogic-s9xxx-armbian/releases/download/${tag}/${asset}"
           fi
           echo "基础镜像: ${url}"
           echo "ARMBIAN_URL=${url}" >> "$GITHUB_ENV"
